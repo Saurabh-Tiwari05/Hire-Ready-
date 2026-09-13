@@ -10,6 +10,7 @@ class SpeechService {
    * @param {string} transcriptData.interviewId - Interview session ID
    * @param {string} transcriptData.questionId - Current question ID
    * @param {string} transcriptData.transcript - Final transcript text
+   * @param {Array} transcriptData.alternatives - Browser speech recognition alternatives
    * @param {number} transcriptData.startTime - Recording start timestamp
    * @param {number} transcriptData.endTime - Recording end timestamp
    * @param {number} transcriptData.responseDuration - Response duration in ms

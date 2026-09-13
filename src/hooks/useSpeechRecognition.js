@@ -1,27 +1,77 @@
 // Custom hook for Web Speech API integration
-// Provides stable speech recognition with start/stop, pause/resume,
-// silence handling, timer, transcript and browser-state synchronization.
+//
+// Speech Recognition V3
+// - Continuous recognition
+// - Automatic browser restart
+// - Transcript accumulation
+// - Multiple recognition alternatives
+// - Pause / resume
+// - Browser lifecycle handling
+// - Auto-save
+// - Stable synchronous transcript access
+//
+// IMPORTANT:
+//
+// The Web Speech API is responsible for speech-to-text.
+//
+// Interview-level silence detection and auto-submit are intentionally
+// handled by SpeechRecorder.jsx.
+//
+// This hook must NOT interpret `onspeechend` as "answer finished".
+// Browser speech recognition can emit speechend during normal pauses.
+//
 
 import { useState, useEffect, useCallback, useRef } from "react";
 
+// ============================================================
+// HOOK
+// ============================================================
+
 const useSpeechRecognition = (options = {}) => {
   const {
+    // ----------------------------------------------------------
+    // Callbacks
+    // ----------------------------------------------------------
+
     onTranscriptUpdate,
     onFinalTranscript,
     onStart,
     onStop,
     onError,
     onAutoSave,
+    onStatusChange,
+
+    // ----------------------------------------------------------
+    // Recognition configuration
+    // ----------------------------------------------------------
+
     continuous = true,
     interimResults = true,
+
+    // Technical English generally works better with en-US.
     language = "en-US",
+
     autoSaveInterval = 3000,
-    maxSilenceTimeout = 5000,
+
+    // ----------------------------------------------------------
+    // IMPORTANT:
+    //
+    // Kept for backward compatibility with existing callers.
+    //
+    // SpeechRecorder.jsx now owns interview-level silence
+    // detection, so this hook does NOT use this value to stop
+    // recognition.
+    // ----------------------------------------------------------
+
+    maxSilenceTimeout = 7000,
+
+    // Browser-supported range is usually 1–5.
+    maxAlternatives = 3,
   } = options;
 
-  // --------------------------------------------------
-  // React state
-  // --------------------------------------------------
+  // ==========================================================
+  // STATE
+  // ==========================================================
 
   const [isListening, setIsListening] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -40,28 +90,76 @@ const useSpeechRecognition = (options = {}) => {
   const [endTime, setEndTime] = useState(null);
   const [elapsedTime, setElapsedTime] = useState(0);
 
-  // --------------------------------------------------
-  // Refs
-  // --------------------------------------------------
+  // ==========================================================
+  // REFS
+  // ==========================================================
 
   const recognitionRef = useRef(null);
 
   const autoSaveRef = useRef(null);
   const silenceTimeoutRef = useRef(null);
+  const restartTimeoutRef = useRef(null);
 
-  const transcriptHistoryRef = useRef([]);
+  // ----------------------------------------------------------
+  // AUTHORITATIVE TRANSCRIPT
+  // ----------------------------------------------------------
+
+  // This is the source of truth for the completed answer.
   const finalTranscriptRef = useRef("");
 
-  // Browser recognition state
+  // Current temporary browser hypothesis.
+  const interimTranscriptRef = useRef("");
+
+  // ----------------------------------------------------------
+  // METADATA REFS
+  // ----------------------------------------------------------
+
+  const wordCountRef = useRef(0);
+  const confidenceRef = useRef(0);
+
+  const startTimeRef = useRef(null);
+
+  // ----------------------------------------------------------
+  // RECOGNITION LIFECYCLE
+  // ----------------------------------------------------------
+
   const recognitionRunningRef = useRef(false);
+
+  // Whether the current answer should continue recording.
   const shouldBeRecordingRef = useRef(false);
+
+  // True when stop/pause/clear was explicitly requested.
   const manuallyStoppedRef = useRef(false);
 
-  // Prevent duplicate final processing
-  const lastFinalTranscriptRef = useRef("");
+  // Used to invalidate stale restart timers.
+  const recordingSessionRef = useRef(0);
 
-  // Keep latest callback references without forcing
-  // SpeechRecognition instance to be recreated.
+  // ----------------------------------------------------------
+  // DUPLICATE FINAL RESULT PROTECTION
+  // ----------------------------------------------------------
+
+  const lastFinalSegmentRef = useRef("");
+
+  // ----------------------------------------------------------
+  // RECOGNITION ALTERNATIVES
+  // ----------------------------------------------------------
+
+  const alternativesRef = useRef([]);
+
+  // ==========================================================
+  // CALLBACK REFS
+  // ==========================================================
+  //
+  // Callback functions can change identity on every render.
+  //
+  // Keeping them in a ref prevents the SpeechRecognition
+  // instance from being recreated unnecessarily.
+  //
+  // IMPORTANT:
+  // onStatusChange MUST be included both here and in the
+  // synchronization effect.
+  // ==========================================================
+
   const callbacksRef = useRef({
     onTranscriptUpdate,
     onFinalTranscript,
@@ -69,6 +167,7 @@ const useSpeechRecognition = (options = {}) => {
     onStop,
     onError,
     onAutoSave,
+    onStatusChange,
   });
 
   useEffect(() => {
@@ -79,6 +178,7 @@ const useSpeechRecognition = (options = {}) => {
       onStop,
       onError,
       onAutoSave,
+      onStatusChange,
     };
   }, [
     onTranscriptUpdate,
@@ -87,11 +187,12 @@ const useSpeechRecognition = (options = {}) => {
     onStop,
     onError,
     onAutoSave,
+    onStatusChange,
   ]);
 
-  // --------------------------------------------------
-  // Initialize Speech Recognition
-  // --------------------------------------------------
+  // ==========================================================
+  // INITIALIZE SPEECH RECOGNITION
+  // ==========================================================
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -114,19 +215,42 @@ const useSpeechRecognition = (options = {}) => {
 
     const instance = new SpeechRecognition();
 
+    // ========================================================
+    // BASIC CONFIGURATION
+    // ========================================================
+
     instance.continuous = continuous;
     instance.interimResults = interimResults;
-    instance.lang = language;
+    instance.lang = language || "en-US";
+
+    // --------------------------------------------------------
+    // Multiple recognition alternatives
+    // --------------------------------------------------------
+
+    try {
+      instance.maxAlternatives = Math.max(
+        1,
+        Math.min(maxAlternatives, 5)
+      );
+    } catch (err) {
+      console.warn(
+        "[SPEECH] maxAlternatives is not configurable:",
+        err
+      );
+    }
 
     recognitionRef.current = instance;
+
     setIsSupported(true);
 
-    // --------------------------------------------------
-    // Recognition started
-    // --------------------------------------------------
+    // ========================================================
+    // ON START
+    // ========================================================
 
     instance.onstart = () => {
-      console.log("[SPEECH] Browser recognition started");
+      console.log(
+        "[SPEECH] Browser recognition started"
+      );
 
       recognitionRunningRef.current = true;
 
@@ -134,9 +258,12 @@ const useSpeechRecognition = (options = {}) => {
       setIsRecording(true);
       setError(null);
 
-      // Only create start time when a new recording starts.
-      if (!startTime) {
+      // Start time belongs to the answer, not each browser
+      // recognition restart.
+      if (!startTimeRef.current) {
         const now = Date.now();
+
+        startTimeRef.current = now;
 
         setStartTime(now);
         setEndTime(null);
@@ -144,26 +271,35 @@ const useSpeechRecognition = (options = {}) => {
       }
 
       callbacksRef.current.onStart?.();
+
+      callbacksRef.current.onStatusChange?.({
+        type: "recognitionstart",
+      });
     };
 
-    // --------------------------------------------------
-    // Recognition ended
-    // --------------------------------------------------
+    // ========================================================
+    // ON END
+    // ========================================================
 
     instance.onend = () => {
-      console.log("[SPEECH] Browser recognition ended");
+      console.log(
+        "[SPEECH] Browser recognition ended"
+      );
 
       recognitionRunningRef.current = false;
 
-      clearTimeout(silenceTimeoutRef.current);
-
       setIsListening(false);
 
-      // If application still wants recording,
-      // restart recognition automatically.
+      // ------------------------------------------------------
+      // IMPORTANT:
       //
-      // This is important because Chrome can terminate
-      // SpeechRecognition even when continuous=true.
+      // Browser recognition can end even while the interview
+      // answer is still active.
+      //
+      // If SpeechRecorder still wants recording, restart the
+      // browser recognition WITHOUT resetting the transcript.
+      // ------------------------------------------------------
+
       if (
         shouldBeRecordingRef.current &&
         !manuallyStoppedRef.current
@@ -172,85 +308,154 @@ const useSpeechRecognition = (options = {}) => {
           "[SPEECH] Recognition ended unexpectedly. Restarting..."
         );
 
-        setTimeout(() => {
+        callbacksRef.current.onStatusChange?.({
+          type: "recognitionend",
+          restarting: true,
+        });
+
+        const sessionId =
+          recordingSessionRef.current;
+
+        clearTimeout(restartTimeoutRef.current);
+
+        restartTimeoutRef.current = setTimeout(() => {
+          // --------------------------------------------------
+          // Ignore stale restart timer.
+          // --------------------------------------------------
+
           if (
-            recognitionRef.current &&
-            shouldBeRecordingRef.current &&
-            !recognitionRunningRef.current
+            sessionId !==
+            recordingSessionRef.current
           ) {
-            try {
-              recognitionRef.current.start();
-            } catch (err) {
-              console.warn(
-                "[SPEECH] Restart failed:",
-                err
-              );
-            }
+            console.log(
+              "[SPEECH] Ignoring stale restart timer."
+            );
+
+            return;
           }
-        }, 200);
-      } else {
-        setIsRecording(false);
-        setIsPaused(false);
 
-        const now = Date.now();
+          // --------------------------------------------------
+          // Recording no longer required.
+          // --------------------------------------------------
 
-        setEndTime(now);
-
-        callbacksRef.current.onStop?.();
-      }
-    };
-
-    // --------------------------------------------------
-    // Speech started
-    // --------------------------------------------------
-
-    instance.onspeechstart = () => {
-      console.log("[SPEECH] Speech started");
-
-      clearTimeout(silenceTimeoutRef.current);
-    };
-
-    // --------------------------------------------------
-    // Speech ended
-    // --------------------------------------------------
-
-    instance.onspeechend = () => {
-      console.log(
-        "[SPEECH] Speech ended. Starting silence timer..."
-      );
-
-      clearTimeout(silenceTimeoutRef.current);
-
-      silenceTimeoutRef.current = setTimeout(() => {
-        if (
-          shouldBeRecordingRef.current &&
-          recognitionRunningRef.current
-        ) {
-          console.log(
-            "[SPEECH] Silence timeout reached. Stopping..."
-          );
-
-          shouldBeRecordingRef.current = false;
-          manuallyStoppedRef.current = true;
+          if (
+            !recognitionRef.current ||
+            !shouldBeRecordingRef.current ||
+            manuallyStoppedRef.current ||
+            recognitionRunningRef.current
+          ) {
+            return;
+          }
 
           try {
-            instance.stop();
+            console.log(
+              "[SPEECH] Restarting recognition..."
+            );
+
+            recognitionRef.current.start();
           } catch (err) {
             console.warn(
-              "[SPEECH] Stop after silence failed:",
+              "[SPEECH] Recognition restart failed:",
               err
             );
           }
-        }
-      }, maxSilenceTimeout);
+        }, 150);
+
+        return;
+      }
+
+      // ------------------------------------------------------
+      // GENUINE STOP
+      // ------------------------------------------------------
+
+      setIsRecording(false);
+      setIsPaused(false);
+
+      const now = Date.now();
+
+      setEndTime(now);
+
+      if (startTimeRef.current) {
+        setElapsedTime(
+          now - startTimeRef.current
+        );
+      }
+
+      callbacksRef.current.onStatusChange?.({
+        type: "recognitionend",
+        restarting: false,
+      });
+
+      callbacksRef.current.onStop?.();
     };
 
-    // --------------------------------------------------
-    // Recognition results
-    // --------------------------------------------------
+    // ========================================================
+    // SPEECH START
+    // ========================================================
+
+    instance.onspeechstart = () => {
+      console.log(
+        "[SPEECH] Speech started"
+      );
+
+      // No interview-level silence timer here.
+      clearTimeout(
+        silenceTimeoutRef.current
+      );
+
+      // ------------------------------------------------------
+      // Tell SpeechRecorder that actual candidate speech has
+      // started.
+      //
+      // SpeechRecorder uses this to reset its 7-second
+      // interview-level silence clock.
+      // ------------------------------------------------------
+
+      callbacksRef.current.onStatusChange?.({
+        type: "speechstart",
+      });
+    };
+
+    // ========================================================
+    // SPEECH END
+    // ========================================================
+
+    instance.onspeechend = () => {
+      console.log(
+        "[SPEECH] Speech ended."
+      );
+
+      clearTimeout(
+        silenceTimeoutRef.current
+      );
+
+      // ------------------------------------------------------
+      // VERY IMPORTANT:
+      //
+      // DO NOT call instance.stop() here.
+      //
+      // Web Speech API can report speechend during normal
+      // pauses between sentences.
+      //
+      // SpeechRecorder.jsx owns the interview-level
+      // 7-second silence detection.
+      // ------------------------------------------------------
+
+      console.log(
+        "[SPEECH] Speech ended. Waiting for more speech..."
+      );
+
+      callbacksRef.current.onStatusChange?.({
+        type: "speechend",
+      });
+    };
+
+    // ========================================================
+    // ON RESULT
+    // ========================================================
 
     instance.onresult = (event) => {
-      let currentInterimTranscript = "";
+      let currentInterim = "";
 
       for (
         let i = event.resultIndex;
@@ -263,98 +468,212 @@ const useSpeechRecognition = (options = {}) => {
           continue;
         }
 
-        const transcriptText =
-          result[0].transcript;
+        const primaryText =
+          result[0].transcript?.trim();
 
-        // -------------------------------
-        // FINAL result
-        // -------------------------------
+        if (!primaryText) {
+          continue;
+        }
 
-        if (result.isFinal) {
-          const cleanText = transcriptText.trim();
+        // ====================================================
+        // COLLECT ALTERNATIVES
+        // ====================================================
 
-          if (!cleanText) {
+        const alternatives = [];
+
+        for (
+          let j = 0;
+          j < result.length;
+          j++
+        ) {
+          const alternative = result[j];
+
+          if (!alternative) {
             continue;
           }
 
-          const previousTranscript =
+          const alternativeText =
+            alternative.transcript?.trim();
+
+          if (!alternativeText) {
+            continue;
+          }
+
+          alternatives.push({
+            text: alternativeText,
+            confidence:
+              alternative.confidence || 0,
+          });
+        }
+
+        alternativesRef.current =
+          alternatives;
+
+        // ====================================================
+        // FINAL RESULT
+        // ====================================================
+
+        if (result.isFinal) {
+          const text = primaryText;
+
+          // --------------------------------------------------
+          // Duplicate protection
+          // --------------------------------------------------
+
+          if (
+            text.toLowerCase() ===
+            lastFinalSegmentRef.current.toLowerCase()
+          ) {
+            console.warn(
+              "[SPEECH] Ignoring duplicate final segment:",
+              text
+            );
+
+            continue;
+          }
+
+          lastFinalSegmentRef.current =
+            text;
+
+          // --------------------------------------------------
+          // Append to authoritative transcript
+          // --------------------------------------------------
+
+          const previous =
             finalTranscriptRef.current.trim();
 
-          const updatedTranscript = previousTranscript
-            ? `${previousTranscript} ${cleanText}`
-            : cleanText;
+          const updated = previous
+            ? `${previous} ${text}`
+            : text;
 
           finalTranscriptRef.current =
-            updatedTranscript;
+            updated;
 
-          setTranscript(updatedTranscript);
+          setTranscript(updated);
+
+          // --------------------------------------------------
+          // Clear interim
+          // --------------------------------------------------
+
+          interimTranscriptRef.current =
+            "";
 
           setInterimTranscript("");
 
-          const words = cleanText
+          // --------------------------------------------------
+          // WORD COUNT
+          // --------------------------------------------------
+
+          const newWords = text
             .split(/\s+/)
             .filter(Boolean);
 
-          setWordCount((prev) => prev + words.length);
+          wordCountRef.current +=
+            newWords.length;
 
-          setConfidence(
-            result[0].confidence || 0
+          setWordCount(
+            wordCountRef.current
           );
 
-          // Prevent exact duplicate final chunks.
-          if (
-            lastFinalTranscriptRef.current !==
-            updatedTranscript
-          ) {
-            lastFinalTranscriptRef.current =
-              updatedTranscript;
+          // --------------------------------------------------
+          // CONFIDENCE
+          // --------------------------------------------------
 
-            console.log(
-              "[SPEECH] Final transcript:",
-              updatedTranscript
-            );
+          const resultConfidence =
+            result[0].confidence || 0;
 
-            callbacksRef.current.onFinalTranscript?.(
-              updatedTranscript,
+          confidenceRef.current =
+            resultConfidence;
+
+          setConfidence(
+            resultConfidence
+          );
+
+          // --------------------------------------------------
+          // DEBUG
+          // --------------------------------------------------
+
+          console.log(
+            "[SPEECH] Final segment:",
+            text
+          );
+
+          console.log(
+            "[SPEECH] Alternatives:",
+            alternatives.map((a) => ({
+              transcript: a.text,
+              confidence: a.confidence,
+            }))
+          );
+
+          console.log(
+            "[SPEECH] Complete transcript:",
+            updated
+          );
+
+          // --------------------------------------------------
+          // CALLBACK
+          // --------------------------------------------------
+
+          callbacksRef.current
+            .onFinalTranscript?.(
+              text,
               {
-                wordCount: words.length,
+                wordCount:
+                  wordCountRef.current,
+
                 confidence:
-                  result[0].confidence || 0,
+                  resultConfidence,
+
+                alternatives,
+
                 timestamp: Date.now(),
               }
             );
-          }
 
           continue;
         }
 
-        // -------------------------------
-        // INTERIM result
-        // -------------------------------
+        // ====================================================
+        // INTERIM RESULT
+        // ====================================================
 
-        currentInterimTranscript +=
-          transcriptText;
+        currentInterim += `${primaryText} `;
       }
 
+      currentInterim =
+        currentInterim.trim();
+
+      interimTranscriptRef.current =
+        currentInterim;
+
       setInterimTranscript(
-        currentInterimTranscript
+        currentInterim
       );
+
+      // ------------------------------------------------------
+      // UI transcript
+      //
+      // FINAL + CURRENT INTERIM
+      //
+      // finalTranscriptRef remains authoritative.
+      // ------------------------------------------------------
 
       const fullTranscript =
-        `${finalTranscriptRef.current} ${currentInterimTranscript}`
-          .trim();
+        `${finalTranscriptRef.current} ${currentInterim}`.trim();
 
-      callbacksRef.current.onTranscriptUpdate?.(
-        fullTranscript,
-        {
-          isFinal: false,
-        }
-      );
+      callbacksRef.current
+        .onTranscriptUpdate?.(
+          fullTranscript,
+          {
+            isFinal: false,
+          }
+        );
     };
 
-    // --------------------------------------------------
-    // Recognition error
-    // --------------------------------------------------
+    // ========================================================
+    // ERROR
+    // ========================================================
 
     instance.onerror = (event) => {
       console.warn(
@@ -362,14 +681,52 @@ const useSpeechRecognition = (options = {}) => {
         event.error
       );
 
-      // These are common browser-level events and don't
-      // necessarily mean the microphone is broken.
+      // ------------------------------------------------------
+      // NORMAL / RECOVERABLE EVENTS
+      // ------------------------------------------------------
+
       if (
         event.error === "no-speech" ||
         event.error === "aborted"
       ) {
+        callbacksRef.current.onStatusChange?.({
+          type: "recognitionerror",
+          error: event.error,
+          recoverable: true,
+        });
+
         return;
       }
+
+      // ------------------------------------------------------
+      // NETWORK ERROR
+      // ------------------------------------------------------
+
+      if (event.error === "network") {
+        console.warn(
+          "[SPEECH] Network error from speech service."
+        );
+
+        setError(
+          "Speech recognition temporarily lost connection."
+        );
+
+        callbacksRef.current.onError?.(
+          event.error
+        );
+
+        callbacksRef.current.onStatusChange?.({
+          type: "recognitionerror",
+          error: event.error,
+          recoverable: true,
+        });
+
+        return;
+      }
+
+      // ------------------------------------------------------
+      // REAL ERROR
+      // ------------------------------------------------------
 
       setError(
         `Speech recognition error: ${event.error}`
@@ -379,15 +736,26 @@ const useSpeechRecognition = (options = {}) => {
         event.error
       );
 
-      // Microphone/audio failure means we cannot
-      // reliably continue.
+      callbacksRef.current.onStatusChange?.({
+        type: "recognitionerror",
+        error: event.error,
+        recoverable: false,
+      });
+
+      // ------------------------------------------------------
+      // MICROPHONE / PERMISSION FAILURE
+      // ------------------------------------------------------
+
       if (
         event.error === "audio-capture" ||
         event.error === "not-allowed" ||
         event.error === "service-not-allowed"
       ) {
-        shouldBeRecordingRef.current = false;
-        manuallyStoppedRef.current = true;
+        shouldBeRecordingRef.current =
+          false;
+
+        manuallyStoppedRef.current =
+          true;
 
         setIsListening(false);
         setIsRecording(false);
@@ -395,25 +763,36 @@ const useSpeechRecognition = (options = {}) => {
       }
     };
 
-    // --------------------------------------------------
-    // Cleanup
-    // --------------------------------------------------
+    // ========================================================
+    // CLEANUP
+    // ========================================================
 
     return () => {
       console.log(
         "[SPEECH] Destroying recognition instance"
       );
 
-      shouldBeRecordingRef.current = false;
-      manuallyStoppedRef.current = true;
+      // Invalidate any old restart timer.
+      recordingSessionRef.current++;
 
-      clearTimeout(autoSaveRef.current);
-      clearTimeout(silenceTimeoutRef.current);
+      shouldBeRecordingRef.current =
+        false;
+
+      manuallyStoppedRef.current =
+        true;
+
+      clearInterval(autoSaveRef.current);
+      clearTimeout(
+        silenceTimeoutRef.current
+      );
+      clearTimeout(
+        restartTimeoutRef.current
+      );
 
       try {
         instance.stop();
       } catch (err) {
-        // Ignore "not started" browser error.
+        // Browser may throw if already stopped.
       }
 
       instance.onstart = null;
@@ -423,80 +802,109 @@ const useSpeechRecognition = (options = {}) => {
       instance.onspeechstart = null;
       instance.onspeechend = null;
 
-      if (recognitionRef.current === instance) {
-        recognitionRef.current = null;
+      if (
+        recognitionRef.current ===
+        instance
+      ) {
+        recognitionRef.current =
+          null;
       }
     };
   }, [
     continuous,
     interimResults,
     language,
-    maxSilenceTimeout,
+    maxAlternatives,
   ]);
 
-  // --------------------------------------------------
-  // Auto-save
-  // --------------------------------------------------
+  // ==========================================================
+  // AUTO SAVE
+  // ==========================================================
+  //
+  // IMPORTANT:
+  //
+  // Do NOT depend on elapsedTime here.
+  //
+  // elapsedTime changes every 100ms. If this effect used
+  // elapsedTime as a dependency, the timeout would constantly
+  // be cancelled and recreated.
+  //
+  // Use a real interval instead.
+  // ==========================================================
 
   useEffect(() => {
     if (
       autoSaveInterval <= 0 ||
-      !transcript ||
       !isRecording ||
       isPaused
     ) {
       return;
     }
 
-    clearTimeout(autoSaveRef.current);
+    clearInterval(autoSaveRef.current);
 
-    autoSaveRef.current = setTimeout(() => {
+    autoSaveRef.current = setInterval(() => {
+      const latestTranscript =
+        finalTranscriptRef.current.trim();
+
       if (
         callbacksRef.current.onAutoSave &&
-        transcript.trim()
+        latestTranscript
       ) {
         callbacksRef.current.onAutoSave({
-          transcript,
-          interimTranscript,
+          transcript:
+            latestTranscript,
+
+          interimTranscript:
+            interimTranscriptRef.current,
+
           isFinal: true,
-          wordCount,
-          confidence,
-          startTime,
-          elapsedTime,
+
+          wordCount:
+            wordCountRef.current,
+
+          confidence:
+            confidenceRef.current,
+
+          startTime:
+            startTimeRef.current,
+
+          elapsedTime:
+            startTimeRef.current
+              ? Date.now() -
+                startTimeRef.current
+              : 0,
         });
       }
     }, autoSaveInterval);
 
     return () => {
-      clearTimeout(autoSaveRef.current);
+      clearInterval(
+        autoSaveRef.current
+      );
     };
   }, [
     autoSaveInterval,
-    transcript,
-    interimTranscript,
     isRecording,
     isPaused,
-    wordCount,
-    confidence,
-    startTime,
-    elapsedTime,
   ]);
 
-  // --------------------------------------------------
-  // Elapsed timer
-  // --------------------------------------------------
+  // ==========================================================
+  // ELAPSED TIMER
+  // ==========================================================
 
   useEffect(() => {
     let interval = null;
 
     if (
       isRecording &&
-      startTime &&
+      startTimeRef.current &&
       !isPaused
     ) {
       interval = setInterval(() => {
         setElapsedTime(
-          Date.now() - startTime
+          Date.now() -
+            startTimeRef.current
         );
       }, 100);
     }
@@ -508,54 +916,104 @@ const useSpeechRecognition = (options = {}) => {
     };
   }, [
     isRecording,
-    startTime,
     isPaused,
   ]);
 
-  // --------------------------------------------------
+  // ==========================================================
   // START
-  // --------------------------------------------------
+  // ==========================================================
 
   const start = useCallback(() => {
-    const instance = recognitionRef.current;
+    const instance =
+      recognitionRef.current;
 
     if (!instance || !isSupported) {
       console.warn(
         "[SPEECH] Recognition is not available."
       );
+
       return;
     }
 
-    // Already running → don't call start() again.
-    if (recognitionRunningRef.current) {
+    if (
+      recognitionRunningRef.current
+    ) {
       console.warn(
         "[SPEECH] Recognition is already running."
       );
+
       return;
     }
 
-    console.log("[SPEECH] Starting recognition...");
+    console.log(
+      "[SPEECH] Starting NEW answer..."
+    );
 
-    // Reset recording state.
+    // --------------------------------------------------------
+    // RESET ANSWER STATE
+    // --------------------------------------------------------
+
     setTranscript("");
     setInterimTranscript("");
     setError(null);
+
     setWordCount(0);
     setConfidence(0);
+
     setElapsedTime(0);
     setStartTime(null);
     setEndTime(null);
 
-    finalTranscriptRef.current = "";
-    transcriptHistoryRef.current = [];
-    lastFinalTranscriptRef.current = "";
+    finalTranscriptRef.current =
+      "";
 
-    shouldBeRecordingRef.current = true;
-    manuallyStoppedRef.current = false;
+    interimTranscriptRef.current =
+      "";
 
-    clearTimeout(silenceTimeoutRef.current);
+    wordCountRef.current = 0;
+    confidenceRef.current = 0;
+
+    startTimeRef.current = null;
+
+    alternativesRef.current = [];
+
+    lastFinalSegmentRef.current =
+      "";
+
+    // --------------------------------------------------------
+    // START RECORDING SESSION
+    // --------------------------------------------------------
+
+    shouldBeRecordingRef.current =
+      true;
+
+    manuallyStoppedRef.current =
+      false;
+
+    recordingSessionRef.current++;
+
+    clearTimeout(
+      silenceTimeoutRef.current
+    );
+
+    clearTimeout(
+      restartTimeoutRef.current
+    );
+
+    callbacksRef.current.onStatusChange?.({
+      type: "answerstart",
+    });
 
     try {
+      instance.lang =
+        language || "en-US";
+
+      instance.continuous =
+        continuous;
+
+      instance.interimResults =
+        interimResults;
+
       instance.start();
     } catch (err) {
       console.error(
@@ -563,7 +1021,8 @@ const useSpeechRecognition = (options = {}) => {
         err
       );
 
-      shouldBeRecordingRef.current = false;
+      shouldBeRecordingRef.current =
+        false;
 
       setIsListening(false);
       setIsRecording(false);
@@ -571,28 +1030,69 @@ const useSpeechRecognition = (options = {}) => {
       setError(
         "Could not start microphone. Please try again."
       );
-    }
-  }, [isSupported]);
 
-  // --------------------------------------------------
+      callbacksRef.current.onError?.(
+        err
+      );
+    }
+  }, [
+    isSupported,
+    language,
+    continuous,
+    interimResults,
+  ]);
+
+  // ==========================================================
   // STOP
-  // --------------------------------------------------
+  // ==========================================================
 
   const stop = useCallback(() => {
-    const instance = recognitionRef.current;
+    const instance =
+      recognitionRef.current;
 
     if (!instance) {
       return;
     }
 
-    console.log("[SPEECH] Manual stop");
+    console.log(
+      "[SPEECH] Manual stop"
+    );
 
-    shouldBeRecordingRef.current = false;
-    manuallyStoppedRef.current = true;
+    // --------------------------------------------------------
+    // IMPORTANT:
+    //
+    // Stopping the browser does NOT clear finalTranscriptRef.
+    //
+    // The browser may still emit one final `onresult` before
+    // `onend`.
+    //
+    // SpeechRecorder intentionally waits briefly after calling
+    // stop() so that final result can be incorporated.
+    // --------------------------------------------------------
 
-    clearTimeout(silenceTimeoutRef.current);
+    recordingSessionRef.current++;
 
-    if (recognitionRunningRef.current) {
+    shouldBeRecordingRef.current =
+      false;
+
+    manuallyStoppedRef.current =
+      true;
+
+    clearTimeout(
+      silenceTimeoutRef.current
+    );
+
+    clearTimeout(
+      restartTimeoutRef.current
+    );
+
+    callbacksRef.current.onStatusChange?.({
+      type: "stoprequested",
+    });
+
+    if (
+      recognitionRunningRef.current
+    ) {
       try {
         instance.stop();
       } catch (err) {
@@ -608,56 +1108,114 @@ const useSpeechRecognition = (options = {}) => {
     }
   }, []);
 
-  // --------------------------------------------------
+  // ==========================================================
   // PAUSE
-  // --------------------------------------------------
+  // ==========================================================
 
   const pause = useCallback(() => {
-    if (!recognitionRunningRef.current) {
+    const instance =
+      recognitionRef.current;
+
+    if (!instance) {
       return;
     }
 
-    console.log("[SPEECH] Pausing recognition");
+    console.log(
+      "[SPEECH] Pausing recognition"
+    );
 
     setIsPaused(true);
 
-    // Keep recording session alive logically.
-    // Browser SpeechRecognition has no reliable pause()
-    // API, so we stop recognition and restart on resume.
-    manuallyStoppedRef.current = true;
+    // --------------------------------------------------------
+    // Pause means browser recognition stops, but transcript
+    // remains intact.
+    // --------------------------------------------------------
 
-    try {
-      recognitionRef.current?.stop();
-    } catch (err) {
-      console.warn(
-        "[SPEECH] Pause stop failed:",
-        err
-      );
+    shouldBeRecordingRef.current =
+      false;
+
+    manuallyStoppedRef.current =
+      true;
+
+    clearTimeout(
+      silenceTimeoutRef.current
+    );
+
+    clearTimeout(
+      restartTimeoutRef.current
+    );
+
+    callbacksRef.current.onStatusChange?.({
+      type: "pause",
+    });
+
+    if (
+      recognitionRunningRef.current
+    ) {
+      try {
+        instance.stop();
+      } catch (err) {
+        console.warn(
+          "[SPEECH] Pause stop failed:",
+          err
+        );
+      }
     }
   }, []);
 
-  // --------------------------------------------------
+  // ==========================================================
   // RESUME
-  // --------------------------------------------------
+  // ==========================================================
 
   const resume = useCallback(() => {
-    const instance = recognitionRef.current;
+    const instance =
+      recognitionRef.current;
 
     if (!instance || !isSupported) {
       return;
     }
 
-    console.log("[SPEECH] Resuming recognition");
+    console.log(
+      "[SPEECH] Resuming recognition"
+    );
 
     setIsPaused(false);
 
-    shouldBeRecordingRef.current = true;
-    manuallyStoppedRef.current = false;
+    shouldBeRecordingRef.current =
+      true;
+
+    manuallyStoppedRef.current =
+      false;
+
+    recordingSessionRef.current++;
+
+    clearTimeout(
+      silenceTimeoutRef.current
+    );
+
+    clearTimeout(
+      restartTimeoutRef.current
+    );
 
     setError(null);
 
-    if (!recognitionRunningRef.current) {
+    callbacksRef.current.onStatusChange?.({
+      type: "resume",
+    });
+
+    if (
+      !recognitionRunningRef.current
+    ) {
       try {
+        instance.lang =
+          language || "en-US";
+
+        instance.continuous =
+          continuous;
+
+        instance.interimResults =
+          interimResults;
+
         instance.start();
       } catch (err) {
         console.warn(
@@ -666,22 +1224,44 @@ const useSpeechRecognition = (options = {}) => {
         );
       }
     }
-  }, [isSupported]);
+  }, [
+    isSupported,
+    language,
+    continuous,
+    interimResults,
+  ]);
 
-  // --------------------------------------------------
-  // CLEAR / RESET
-  // --------------------------------------------------
+  // ==========================================================
+  // CLEAR
+  // ==========================================================
 
   const clear = useCallback(() => {
-    console.log("[SPEECH] Clearing recording");
+    console.log(
+      "[SPEECH] Clearing recording"
+    );
 
-    const instance = recognitionRef.current;
+    const instance =
+      recognitionRef.current;
 
-    shouldBeRecordingRef.current = false;
-    manuallyStoppedRef.current = true;
+    recordingSessionRef.current++;
 
-    clearTimeout(autoSaveRef.current);
-    clearTimeout(silenceTimeoutRef.current);
+    shouldBeRecordingRef.current =
+      false;
+
+    manuallyStoppedRef.current =
+      true;
+
+    clearInterval(
+      autoSaveRef.current
+    );
+
+    clearTimeout(
+      silenceTimeoutRef.current
+    );
+
+    clearTimeout(
+      restartTimeoutRef.current
+    );
 
     if (
       instance &&
@@ -694,6 +1274,10 @@ const useSpeechRecognition = (options = {}) => {
       }
     }
 
+    // --------------------------------------------------------
+    // Reset React state
+    // --------------------------------------------------------
+
     setTranscript("");
     setInterimTranscript("");
 
@@ -702,6 +1286,7 @@ const useSpeechRecognition = (options = {}) => {
     setIsPaused(false);
 
     setError(null);
+
     setWordCount(0);
     setConfidence(0);
 
@@ -709,20 +1294,41 @@ const useSpeechRecognition = (options = {}) => {
     setEndTime(null);
     setElapsedTime(0);
 
-    finalTranscriptRef.current = "";
-    transcriptHistoryRef.current = [];
-    lastFinalTranscriptRef.current = "";
+    // --------------------------------------------------------
+    // Reset refs
+    // --------------------------------------------------------
 
-    recognitionRunningRef.current = false;
+    finalTranscriptRef.current =
+      "";
+
+    interimTranscriptRef.current =
+      "";
+
+    wordCountRef.current = 0;
+    confidenceRef.current = 0;
+
+    startTimeRef.current = null;
+
+    alternativesRef.current = [];
+
+    lastFinalSegmentRef.current =
+      "";
+
+    recognitionRunningRef.current =
+      false;
+
+    callbacksRef.current.onStatusChange?.({
+      type: "clear",
+    });
   }, []);
 
-  // --------------------------------------------------
-  // Return API
-  // --------------------------------------------------
+  // ==========================================================
+  // RETURN
+  // ==========================================================
 
   return {
-    // State
     isSupported,
+
     isListening,
     isRecording,
     isPaused,
@@ -731,6 +1337,7 @@ const useSpeechRecognition = (options = {}) => {
     interimTranscript,
 
     error,
+
     confidence,
     wordCount,
 
@@ -738,22 +1345,35 @@ const useSpeechRecognition = (options = {}) => {
     startTime,
     endTime,
 
-    // Controls
     start,
     stop,
     pause,
     resume,
     clear,
 
-    // Helpers
-    hasTranscript: !!transcript.trim(),
+    hasTranscript:
+      !!finalTranscriptRef.current.trim(),
 
     isEmpty:
-      !transcript.trim() &&
-      !interimTranscript.trim(),
+      !finalTranscriptRef.current.trim() &&
+      !interimTranscriptRef.current.trim(),
 
     isFinal:
-      !!finalTranscriptRef.current,
+      !!finalTranscriptRef.current.trim(),
+
+    // --------------------------------------------------------
+    // Latest authoritative transcript
+    // --------------------------------------------------------
+
+    getLatestTranscript: () =>
+      finalTranscriptRef.current.trim(),
+
+    // --------------------------------------------------------
+    // Latest recognition alternatives
+    // --------------------------------------------------------
+
+    getLatestAlternatives: () =>
+      alternativesRef.current,
   };
 };
 
