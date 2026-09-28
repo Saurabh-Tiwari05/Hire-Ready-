@@ -468,6 +468,8 @@ export default function InterviewPage() {
   const [messageId, setMessageId] = useState(null);
   const [report, setReport] = useState(null);
   const [evaluationReady, setEvaluationReady] = useState(false);
+  const [isNextQuestionLoading, setIsNextQuestionLoading] = useState(false);
+  const [questionNumber, setQuestionNumber] = useState(0);
   const [permissions, setPermissions] = useState({
     camera: "pending",
     microphone: "pending",
@@ -635,40 +637,58 @@ export default function InterviewPage() {
    * Fetch the next question from the AI interviewer
    */
   const fetchNextQuestion = useCallback(async () => {
+    if (!interview?.contextId) return;
+
     try {
+      setError(null);
+      setIsNextQuestionLoading(true);
+
       const token = localStorage.getItem("hr_token");
+
       const res = await fetch(`${BASE}/interview/question`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ contextId: interview.contextId }),
+        body: JSON.stringify({
+          contextId: interview.contextId,
+        }),
       });
 
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) {
+        throw new Error(await res.text());
+      }
 
       const data = await res.json();
       const question = data.data;
+
       setCurrentQuestion(question);
       setMessageId(question.messageId || null);
+
+      setQuestionNumber((prev) => prev + 1);
+
       setStatus("question");
     } catch (err) {
       console.error("Failed to get next question:", err);
-      setError(err.message || "Failed to get next question");
-    }
-  }, [interview]);
 
-  const handleNextQuestion = useCallback(() => {
-    console.log("[INTERVIEW] Moving to next question...");
+      setError(err.message || "Failed to get next question");
+
+      // Keep interview UI visible instead of switching
+      // to the initial interview loading/error screen.
+      setStatus("question");
+    } finally {
+      setIsNextQuestionLoading(false);
+    }
+  }, [interview?.contextId]);
+
+  const handleNextQuestion = useCallback(async () => {
+    if (isNextQuestionLoading) return;
 
     setEvaluationReady(false);
-    setStatus("loading");
-    setCurrentQuestion(null);
-    setMessageId(null);
 
-    fetchNextQuestion();
-  }, [fetchNextQuestion]);
+    await fetchNextQuestion();
+  }, [fetchNextQuestion, isNextQuestionLoading]);
 
   /**
    * End the interview and generate the final report
@@ -900,25 +920,62 @@ export default function InterviewPage() {
 
                 {/* Question */}
                 {currentQuestion ? (
-                  <GlassCard className="p-6" glow="#00F2FF">
-                    <div className="mb-2 text-xs font-semibold uppercase tracking-widest text-accent">
-                      {currentQuestion.type === "first"
-                        ? "First Question"
-                        : "Follow-up Question"}
-                    </div>
-                    <p className="text-lg text-white leading-relaxed">
-                      {currentQuestion.question}
-                    </p>
-                    {currentQuestion.topic && (
-                      <div className="mt-3 flex items-center gap-2">
-                        <span className="px-2 py-0.5 text-xs rounded-full bg-white/10 text-white/70">
-                          #{currentQuestion.topic}
-                        </span>
-                        <span className="px-2 py-0.5 text-xs rounded-full bg-white/10 text-white/70">
-                          Difficulty: {currentQuestion.difficulty}
-                        </span>
-                      </div>
-                    )}
+                  <GlassCard className="relative p-6" glow="#00F2FF">
+                    <AnimatePresence mode="wait">
+                      {isNextQuestionLoading ? (
+                        <motion.div
+                          key="next-question-loading"
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          exit={{ opacity: 0 }}
+                          className="flex min-h-[110px] items-center justify-center"
+                        >
+                          <div className="flex items-center gap-3">
+                            <div className="h-5 w-5 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+
+                            <span className="text-sm text-white/60">
+                              Generating next question...
+                            </span>
+                          </div>
+                        </motion.div>
+                      ) : (
+                        <motion.div
+                          key={currentQuestion.messageId || questionNumber}
+                          initial={{ opacity: 0, y: 8 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          transition={{ duration: 0.25 }}
+                        >
+                          <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-accent">
+                            <span>Question {questionNumber}</span>
+
+                            {currentQuestion.type === "follow-up" &&
+                              questionNumber > 1 && (
+                                <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[10px]">
+                                  Follow-up
+                                </span>
+                              )}
+                          </div>
+
+                          <p className="text-lg leading-relaxed text-white">
+                            {currentQuestion.question}
+                          </p>
+
+                          {currentQuestion.topic && (
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                              <span className="rounded-full bg-white/10 px-2 py-0.5 text-xs text-white/70">
+                                #{currentQuestion.topic}
+                              </span>
+
+                              {currentQuestion.difficulty && (
+                                <span className="rounded-full bg-white/10 px-2 py-0.5 text-xs text-white/70">
+                                  Difficulty: {currentQuestion.difficulty}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
                   </GlassCard>
                 ) : (
                   <GlassCard className="p-6 text-center">
@@ -1286,9 +1343,12 @@ export default function InterviewPage() {
                               <div className="mt-6 pt-5 border-t border-white/10 flex justify-end">
                                 <button
                                   onClick={handleNextQuestion}
-                                  className="px-6 py-2.5 rounded-lg bg-accent text-black font-semibold hover:opacity-90 transition"
+                                  disabled={isNextQuestionLoading}
+                                  className="px-6 py-2.5 rounded-lg bg-accent text-black font-semibold hover:opacity-90 transition disabled:cursor-not-allowed disabled:opacity-50"
                                 >
-                                  Next Question →
+                                  {isNextQuestionLoading
+                                    ? "Generating..."
+                                    : "Next Question →"}
                                 </button>
                               </div>
                             )}
